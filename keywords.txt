@@ -1,0 +1,50 @@
+#######################################
+# Datatypes (KEYWORD1)
+#######################################
+Device	KEYWORD1
+LED	KEYWORD1
+Button	KEYWORD1
+Pot	KEYWORD1
+RotaryEncoder	KEYWORD1
+IntervalHandle	KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+newLED	KEYWORD2
+newButton	KEYWORD2
+newPot	KEYWORD2
+newRotaryEncoder	KEYWORD2
+led	KEYWORD2
+button	KEYWORD2
+pot	KEYWORD2
+rotaryEncoder	KEYWORD2
+after	KEYWORD2
+every	KEYWORD2
+update	KEYWORD2
+turnOn	KEYWORD2
+turnOff	KEYWORD2
+flip	KEYWORD2
+blink	KEYWORD2
+pulse	KEYWORD2
+setLevel	KEYWORD2
+setColor	KEYWORD2
+onPress	KEYWORD2
+onRelease	KEYWORD2
+onChange	KEYWORD2
+onClockwise	KEYWORD2
+onCounterClockwise	KEYWORD2
+inputRange	KEYWORD2
+outputRange	KEYWORD2
+changeThreshold	KEYWORD2
+smoothing	KEYWORD2
+withMessage	KEYWORD2
+stop	KEYWORD2
+value	KEYWORD2
+
+#######################################
+# Constants (LITERAL1)
+#######################################
+BUTTON_PRESS_HIGH	LITERAL1
+BUTTON_PRESS_LOW	LITERAL1
+BUTTON_INPUT_PULLUP	LITERAL1

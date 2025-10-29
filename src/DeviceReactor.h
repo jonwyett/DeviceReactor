@@ -45,6 +45,10 @@
   #define ENCODER_DEBOUNCE_DELAY 5
 #endif
 
+#ifndef MAX_ZONES_PER_SENSOR
+  #define MAX_ZONES_PER_SENSOR 0
+#endif
+
 /****** END CONFIGURATION ****************************************************/
 
 // Invalid handle constant
@@ -271,6 +275,35 @@ typedef void (*intParamCallback)(int);
 #if TOTAL_ANALOG_SENSORS > 0
   class AnalogSensor {
     public:
+      // Sprint 5: Preset enum for common configurations
+      enum Preset {
+        RAW_DATA,              // No processing, raw 0-1023 values
+        POT_FOR_LED,           // Smooth, continuous 0-255 for analogWrite
+        POT_FOR_SERVO,         // Smooth, continuous 0-180 for servo control
+        POT_FOR_PERCENTAGE,    // Stable 0-100 in steps of 5
+        SWITCH_5_POSITION      // Heavy 5-position switch (0-4)
+      };
+
+      // Sprint 5: Preset configuration structure
+      struct PresetConfig {
+        byte smoothing_samples;
+        int output_min;
+        int output_max;
+        int quantize_step;      // Q value
+        int hysteresis_amount;  // H value
+        int change_threshold;   // T value for non-quantized mode
+      };
+
+      // Zone structure for zone-based state management
+      struct Zone {
+        byte id;
+        int min_val;
+        int max_val;
+      };
+
+      // Sprint 5: Static preset configurations array
+      static const PresetConfig preset_configs[];
+
       byte pin;
 
       void init(byte newPin) {
@@ -303,8 +336,17 @@ typedef void (*intParamCallback)(int);
         return *this;
       }
 
+      // Sprint 5: Overloaded quantize() methods
       AnalogSensor& quantize(int step) {
         quantizeStep = step;
+        // Automatically calculate H = Q / 4 for balanced feel
+        hysteresis_amount = step / 4;
+        return *this;
+      }
+
+      AnalogSensor& quantize(int step, int hysteresis) {
+        quantizeStep = step;
+        hysteresis_amount = hysteresis;
         return *this;
       }
 
@@ -321,6 +363,89 @@ typedef void (*intParamCallback)(int);
       AnalogSensor& onChange(intParamCallback callback) {
         hasChangeFunc = true;
         changed = callback;
+        return *this;
+      }
+
+      // Sprint 2: Zone configuration methods
+      AnalogSensor& addZone(byte id, int min_value, int max_value) {
+        if (zone_count >= MAX_ZONES_PER_SENSOR) {
+          #ifdef DEVICE_REACTOR_DEBUG
+            DR_DEBUG_PRINTLN("ERROR: Maximum zones reached for this sensor");
+          #endif
+          return *this;
+        }
+
+        // Validate zone boundaries
+        if (min_value > max_value) {
+          #ifdef DEVICE_REACTOR_DEBUG
+            DR_DEBUG_PRINTLN("ERROR: Zone min_value must be <= max_value");
+          #endif
+          return *this;
+        }
+
+        defined_zones[zone_count].id = id;
+        defined_zones[zone_count].min_val = min_value;
+        defined_zones[zone_count].max_val = max_value;
+        zone_count++;
+
+        #ifdef DEVICE_REACTOR_DEBUG
+          DR_DEBUG_PRINT("Defined zone ID ");
+          DR_DEBUG_PRINT(id);
+          DR_DEBUG_PRINT(" [");
+          DR_DEBUG_PRINT(min_value);
+          DR_DEBUG_PRINT(", ");
+          DR_DEBUG_PRINT(max_value);
+          DR_DEBUG_PRINTLN("]");
+        #endif
+
+        return *this;
+      }
+
+      AnalogSensor& clearZones() {
+        zone_count = 0;
+        currentZoneID = INVALID_HANDLE;
+        previousZoneID = INVALID_HANDLE;
+        #ifdef DEVICE_REACTOR_DEBUG
+          DR_DEBUG_PRINTLN("Cleared all zones");
+        #endif
+        return *this;
+      }
+
+      // Sprint 5: High-level preset configuration
+      AnalogSensor& configure(Preset preset) {
+        // Cast enum to index for array lookup
+        int index = static_cast<int>(preset);
+        const PresetConfig& config = preset_configs[index];
+
+        // Apply common settings
+        smoothing(config.smoothing_samples);
+        outputRange(config.output_min, config.output_max);
+
+        // Apply stability mode based on recipe
+        if (config.quantize_step > 0) {
+          // Quantization mode enabled
+          // If H is 0 in table, use auto-calculated default (Q/4)
+          int h = (config.hysteresis_amount > 0)
+                    ? config.hysteresis_amount
+                    : config.quantize_step / 4;
+          quantize(config.quantize_step, h);
+        } else {
+          // Continuous mode with change threshold
+          changeThreshold(config.change_threshold);
+        }
+
+        #ifdef DEVICE_REACTOR_DEBUG
+          DR_DEBUG_PRINT("Applied preset configuration: ");
+          DR_DEBUG_PRINTLN(index);
+        #endif
+
+        return *this;
+      }
+
+      // Sprint 4: Zone change event callback
+      AnalogSensor& onZoneChange(byteParamCallback callback) {
+        hasZoneChangeFunc = true;
+        zoneChanged = callback;
         return *this;
       }
 
@@ -355,40 +480,103 @@ typedef void (*intParamCallback)(int);
           // Calculate the average value from accumulated sum
           int avgValue = accumulatedSum / avgSamples;
 
-          // Map from input range to output range
-          currentValue = map(avgValue, inputMin, inputMax, outputMin, outputMax);
+          // Clamp to INPUT range first
+          if (avgValue < inputMin) avgValue = inputMin;
+          if (avgValue > inputMax) avgValue = inputMax;
 
-          // Clamp to output range
-          if (currentValue < outputMin) currentValue = outputMin;
-          if (currentValue > outputMax) currentValue = outputMax;
+          // Map from input range to output range
+          hiResValue = map(avgValue, inputMin, inputMax, outputMin, outputMax);
+
+          // Clamp to OUTPUT range
+          if (hiResValue < outputMin) hiResValue = outputMin;
+          if (hiResValue > outputMax) hiResValue = outputMax;
 
           // Apply inversion if enabled
           if (inverted) {
-            currentValue = outputMax + outputMin - currentValue;
+            hiResValue = outputMax + outputMin - hiResValue;
           }
 
-          // Quantize to grid if enabled
+          // Sprint 3: Mode selection logic for stability
+          bool valueChanged = false;
+          int newValue = hiResValue;
+
           if (quantizeStep > 0) {
-            // Calculate offset to align grid with outputMin
-            // Use modulo that works correctly with negative numbers
-            int offset = ((outputMin % quantizeStep) + quantizeStep) % quantizeStep;
-            currentValue = ((currentValue - offset) / quantizeStep) * quantizeStep + offset;
-            // Ensure we stay within output range after quantization
-            if (currentValue < outputMin) currentValue = outputMin;
-            if (currentValue > outputMax) currentValue = outputMax;
+            // Mode 1: Quantized Hysteresis (Q+H)
+            // Calculate the potential quantized value using proper rounding
+            int V_potential = round((float)hiResValue / quantizeStep) * quantizeStep;
+
+            // Clamp V_potential to output range
+            if (V_potential < outputMin) V_potential = outputMin;
+            if (V_potential > outputMax) V_potential = outputMax;
+
+            // Check if we've crossed a quantization boundary
+            if (V_potential != currentReportedValue) {
+              if (V_potential > currentReportedValue) {
+                // Value is increasing - check upper trigger
+                int trigger_up = (currentReportedValue + quantizeStep / 2) + hysteresis_amount;
+                if (hiResValue >= trigger_up) {
+                  newValue = V_potential;
+                  valueChanged = true;
+                }
+              } else {
+                // Value is decreasing - check lower trigger
+                int trigger_down = (currentReportedValue - quantizeStep / 2) - hysteresis_amount;
+                if (hiResValue <= trigger_down) {
+                  newValue = V_potential;
+                  valueChanged = true;
+                }
+              }
+            }
+          } else if (delta > 1) {
+            // Mode 2: Change Threshold (Floating Anchor)
+            if (abs(hiResValue - currentReportedValue) >= delta) {
+              newValue = hiResValue;
+              valueChanged = true;
+            }
+          } else {
+            // Mode 3: Raw Mode (delta == 1, no quantization)
+            if (hiResValue != currentReportedValue) {
+              newValue = hiResValue;
+              valueChanged = true;
+            }
           }
 
-          // Check if change exceeds threshold (only fire onChange on actual changes)
-          if (abs(currentValue - previousValue) >= delta) {
-            previousValue = currentValue;
+          // Update state and fire onChange if value changed
+          if (valueChanged) {
+            currentReportedValue = newValue;
+            currentValue = newValue;  // Keep currentValue in sync for backward compatibility
+            previousValue = newValue; // Keep previousValue in sync
 
             #ifdef DEVICE_REACTOR_DEBUG
               DR_DEBUG_PRINT("Analog sensor value changed to ");
-              DR_DEBUG_PRINTLN(currentValue);
+              DR_DEBUG_PRINTLN(currentReportedValue);
             #endif
 
             if (hasChangeFunc) {
-              changed(currentValue);
+              changed(currentReportedValue);
+            }
+          }
+
+          // Sprint 4: Zone detection and event firing
+          if (zone_count > 0) {
+            // Find which zone the currentReportedValue falls into
+            byte detectedZoneID = findZoneForValue(currentReportedValue);
+
+            // Update currentZoneID
+            currentZoneID = detectedZoneID;
+
+            // Fire onZoneChange if zone changed
+            if (currentZoneID != previousZoneID) {
+              previousZoneID = currentZoneID;
+
+              #ifdef DEVICE_REACTOR_DEBUG
+                DR_DEBUG_PRINT("Zone changed to ");
+                DR_DEBUG_PRINTLN(currentZoneID);
+              #endif
+
+              if (hasZoneChangeFunc) {
+                zoneChanged(currentZoneID);
+              }
             }
           }
 
@@ -426,10 +614,35 @@ typedef void (*intParamCallback)(int);
       bool hasChangeFunc = false;
       intParamCallback changed;
 
+      // Sprint 1: New state variables for Quantized Hysteresis and Zones
+      int hiResValue = 0;              // Value after smoothing, clamping, and mapping
+      int currentReportedValue = 0;    // Final stable value exposed to the user
+      int hysteresis_amount = 0;        // The 'H' value for Quantized Hysteresis
+
+      // Zone management
+      Zone defined_zones[MAX_ZONES_PER_SENSOR];
+      byte zone_count = 0;
+      byte currentZoneID = INVALID_HANDLE;
+      byte previousZoneID = INVALID_HANDLE;
+
+      // Sprint 4: Zone change callback
+      bool hasZoneChangeFunc = false;
+      byteParamCallback zoneChanged;
+
       void average(int newReading) {
         accumulatedSum += newReading;
         avgCount++;
         // avgCount will be checked in update() to determine if ready to process
+      }
+
+      // Sprint 2: Helper method to find zone for a given value
+      byte findZoneForValue(int val) {
+        for (byte i = 0; i < zone_count; i++) {
+          if (val >= defined_zones[i].min_val && val <= defined_zones[i].max_val) {
+            return defined_zones[i].id;
+          }
+        }
+        return INVALID_HANDLE;  // No zone found
       }
 
       void performInitialRead() {
@@ -448,28 +661,44 @@ typedef void (*intParamCallback)(int);
         // Calculate average (same as update logic)
         int avgValue = accumulatedSum / avgSamples;
 
-        // Map from input range to output range
-        currentValue = map(avgValue, inputMin, inputMax, outputMin, outputMax);
+        // Clamp to INPUT range
+        if (avgValue < inputMin) avgValue = inputMin;
+        if (avgValue > inputMax) avgValue = inputMax;
 
-        // Clamp to output range
-        if (currentValue < outputMin) currentValue = outputMin;
-        if (currentValue > outputMax) currentValue = outputMax;
+        // Map from input range to output range
+        hiResValue = map(avgValue, inputMin, inputMax, outputMin, outputMax);
+
+        // Clamp to OUTPUT range
+        if (hiResValue < outputMin) hiResValue = outputMin;
+        if (hiResValue > outputMax) hiResValue = outputMax;
 
         // Apply inversion if enabled
         if (inverted) {
-          currentValue = outputMax + outputMin - currentValue;
+          hiResValue = outputMax + outputMin - hiResValue;
         }
 
-        // Quantize to grid if enabled
+        // Sprint 3: Initialize currentReportedValue based on mode
         if (quantizeStep > 0) {
-          int offset = ((outputMin % quantizeStep) + quantizeStep) % quantizeStep;
-          currentValue = ((currentValue - offset) / quantizeStep) * quantizeStep + offset;
-          if (currentValue < outputMin) currentValue = outputMin;
-          if (currentValue > outputMax) currentValue = outputMax;
+          // Quantize to nearest grid point using proper rounding
+          currentReportedValue = round((float)hiResValue / quantizeStep) * quantizeStep;
+          // Clamp to output range
+          if (currentReportedValue < outputMin) currentReportedValue = outputMin;
+          if (currentReportedValue > outputMax) currentReportedValue = outputMax;
+        } else {
+          // For Change Threshold or Raw mode, use hiResValue directly
+          currentReportedValue = hiResValue;
         }
 
-        // Set previous value to current so first actual change triggers onChange
-        previousValue = currentValue;
+        // Keep legacy variables in sync for backward compatibility
+        currentValue = currentReportedValue;
+        previousValue = currentReportedValue;
+
+        // Initialize zone state to prevent onZoneChange firing on first update
+        if (zone_count > 0) {
+          byte initialZone = findZoneForValue(currentReportedValue);
+          currentZoneID = initialZone;
+          previousZoneID = initialZone;
+        }
 
         // Reset accumulator for next update cycle
         accumulatedSum = 0;
@@ -479,9 +708,29 @@ typedef void (*intParamCallback)(int);
 
         #ifdef DEVICE_REACTOR_DEBUG
           DR_DEBUG_PRINT("Initial analog sensor value: ");
-          DR_DEBUG_PRINTLN(currentValue);
+          DR_DEBUG_PRINTLN(currentReportedValue);
         #endif
       }
+  };
+
+  // Sprint 5: Define preset configuration data
+  // This array holds the configuration data for each preset.
+  // The order MUST EXACTLY MATCH the order of the Preset enum.
+  const AnalogSensor::PresetConfig AnalogSensor::preset_configs[] = {
+    // RAW_DATA: No processing, raw 0-1023 values
+    { /*smoothing*/ 1, /*out_min*/ 0, /*out_max*/ 1023, /*Q*/ 0, /*H*/ 0, /*T*/ 1 },
+
+    // POT_FOR_LED: Smooth, continuous 0-255 for analogWrite
+    { /*smoothing*/ 8, /*out_min*/ 0, /*out_max*/ 255,  /*Q*/ 0, /*H*/ 0, /*T*/ 2 },
+
+    // POT_FOR_SERVO: Smooth, continuous 0-180 for servo control
+    { /*smoothing*/ 8, /*out_min*/ 0, /*out_max*/ 180,  /*Q*/ 0, /*H*/ 0, /*T*/ 2 },
+
+    // POT_FOR_PERCENTAGE: Stable 0-100 in steps of 5 (T is irrelevant, Q > 0)
+    { /*smoothing*/ 10, /*out_min*/ 0, /*out_max*/ 100, /*Q*/ 5, /*H*/ 1, /*T*/ 1 },
+
+    // SWITCH_5_POSITION: Heavy 5-position switch with strong hysteresis
+    { /*smoothing*/ 12, /*out_min*/ 0, /*out_max*/ 4,   /*Q*/ 1, /*H*/ 1, /*T*/ 1 }
   };
 #endif
 
